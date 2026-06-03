@@ -1,8 +1,7 @@
 import logging
-import json
 import random
+import json
 import tqdm
-import time
 import sys
 import math
 from collections import Counter
@@ -34,10 +33,35 @@ COLORS = {
     "hex_border": "#2c3e50",
 }
 
-PLATE_COUNT = 30
-GRID_IMPORT_PATH = Path(__file__).resolve().parent / "grid_20260603_205338.json"
+PLATE_COUNT = 10
+GRID_IMPORT_PATH = Path(__file__).resolve().parent / ".json"
+
+with open(Path(__file__).resolve().parent / "settings.json", "r", encoding="utf-8") as config_file:
+    settings = json.load(config_file)
 
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s - %(levelname)s]: %(message)s')
+
+def height_to_color(height: float):
+    if height < settings["colors"]["negative_altitudes"]["min"]:
+        return settings["colors"]["negative_altitudes"]["palette"][-1]
+    elif height > settings["colors"]["positive_altitudes"]["max"]:
+        return settings["colors"]["positive_altitudes"]["palette"][0]
+    elif height < 0:
+        step = settings["colors"]["negative_altitudes"]["min"] / len(settings["colors"]["negative_altitudes"]["palette"])
+        index = int(height / step)
+        try:
+            return settings["colors"]["negative_altitudes"]["palette"][-index]
+        except IndexError:
+            logging.warning("Height to color mapping failed for height %s: step=%s, index=%s", height, step, index)
+            return settings["colors"]["negative_altitudes"]["palette"][-1]
+    else:
+        step = settings["colors"]["positive_altitudes"]["max"] / len(settings["colors"]["positive_altitudes"]["palette"])
+        index = int(height / step)
+        try:
+            return settings["colors"]["positive_altitudes"]["palette"][index]
+        except IndexError:
+            logging.warning("Height to color mapping failed for height %s: step=%s, index=%s", height, step, index)
+            return settings["colors"]["positive_altitudes"]["palette"][0]
 
 class Tile:
     def __init__(self, col: int, row: int, index: int, color_str: str):
@@ -49,7 +73,8 @@ class Tile:
         self.plate_id: int | None = None
         self.is_oceanic_plate = False
         self.is_border = True
-        self.height: float = 0.0
+        self.type: str = ""
+        self.height: float | None = None
         self.movement_vector: tuple[float, float] = (0.0, 0.0)
 
 class Plate:
@@ -57,6 +82,12 @@ class Plate:
         self.id = id
         self.color = color_str
         self.oceanic = oceanic
+
+        if self.oceanic:
+            self.height = random.gauss(settings["height_statistics"]["average_sea_height"], settings["height_statistics"]["sea_height_variance"])
+        else:
+            self.height = random.gauss(settings["height_statistics"]["average_land_height"], settings["height_statistics"]["land_height_variance"])
+        
         self.movement_vector: tuple[float, float] = movement_vector
         self.tiles = []
     
@@ -66,6 +97,7 @@ class Plate:
         tile.plate_id = self.id 
         tile.is_oceanic_plate = self.oceanic
         tile.movement_vector = self.movement_vector
+        tile.height = self.height
         self.tiles.append(tile)
 
 
@@ -114,15 +146,14 @@ class HexItem(QGraphicsPolygonItem):
         # Styling
         self.setBrush(QBrush(self.base_color))
         self.setPen(QPen(self.border_color, 1, Qt.PenStyle.SolidLine))
-        self.setToolTip(f"Grid: ({tile.col}, {tile.row})")
 
     def update_color(self, color_mode: str):
         if color_mode == "plates":
             color = QColor(self.tile.plate_color)
         elif color_mode == "oceanic":
             color = QColor(COLORS["ocean_plate"] if self.tile.is_oceanic_plate else COLORS["continental_plate"])
-        elif color_mode == "height":
-            color = blend_colors(QColor(COLORS["plains"]), QColor(COLORS["mountains"]), self.tile.height)
+        elif color_mode == "topology":
+            color = QColor(height_to_color(self.tile.height)) if self.tile.height is not None else QColor("#101010")
         elif color_mode == "border":
             color = QColor(COLORS["border_tile"] if self.tile.is_border else COLORS["interior_tile"])
         elif color_mode == "direction":
@@ -231,7 +262,7 @@ class MainWindow(QMainWindow):
         self.color_mode_selector = QComboBox(self)
         self.color_mode_selector.addItem("Plates", "plates")
         self.color_mode_selector.addItem("Oceanic", "oceanic")
-        self.color_mode_selector.addItem("Height", "height")
+        self.color_mode_selector.addItem("Topology", "topology")
         self.color_mode_selector.addItem("Border", "border")
         self.color_mode_selector.addItem("Direction", "direction")
         self.color_mode_selector.setFixedSize(110, 32)
@@ -256,7 +287,7 @@ class MainWindow(QMainWindow):
             plate = Plate(
                 i,
                 QColor.fromHsl(*hsl_color).name(),
-                oceanic = random.choices([True, False], weights=[7, 3])[0],
+                oceanic = random.choices([True, False], weights=[6, 4])[0],
                 movement_vector=(math.cos(math.radians(movement_angle)) * movement_intensity, math.sin(math.radians(movement_angle)) * movement_intensity)
             )
 
@@ -272,8 +303,10 @@ class MainWindow(QMainWindow):
 
         perlin_noise_map = [[pnoise2(i * 2 * math.cos(math.radians(30)) + 0.5 * (j % 2), j * (1 + math.sin(math.radians(30))), octaves=10) for i in range(GRID_WIDTH)] for j in range(GRID_HEIGHT)]
 
+        plates_estimated_sizes = [random.random() for _ in self.plates]
+
         while any(tile.plate_id is None for tile in self.tiles):
-            current_plate = random.choice(self.plates)
+            current_plate = random.choices(self.plates, weights=plates_estimated_sizes, k=1)[0]
 
             neighboring_tiles = set()
 
@@ -297,7 +330,9 @@ class MainWindow(QMainWindow):
         logging.info("Tile assignment complete.")
         logging.info("Smoothing borders...")
 
-        for _ in tqdm.tqdm(range(len(self.tiles) // 2), desc="Smoothing borders"):
+        for _ in range(len(self.tiles) // 2):
+            i = 0
+
             for tile in self.tiles:
                 if not tile.is_border:
                     continue
@@ -308,6 +343,11 @@ class MainWindow(QMainWindow):
                     candidate_plate_ids = [neighbor.plate_id for neighbor in neighbors if neighbor.plate_id is not None and neighbor.plate_id != tile.plate_id]
                     if candidate_plate_ids:
                         self.plates[random.choice(candidate_plate_ids)].add_tile(tile)
+                        i += 1
+
+            if i==0:
+                break
+
 
         logging.info("Border smoothing complete.")
         logging.info("Creating height map based on plate forces...")
@@ -329,11 +369,83 @@ class MainWindow(QMainWindow):
 
         logging.info("Simulating tectonic forces...")
 
-        for tile in self.tiles:
-            if not tile.is_border:
-                continue
+        neighbor_offsets_map = [ # The distances are actuallly normalized to [-1, 1] because reasons
+                            [-0.498, 0.867],    [0, 1],     [0.498, 0.867],
 
-            self.get_neighbors(tile.index, distance=2)
+                    [-0.866, 0.5],  [-0.5, 0.866],  [0.5, 0.866],   [0.866, 0.5],
+
+            [-1, 0],        [-1, 0],                                [1, 0],     [1, 0],
+
+                    [-0.866, -0.5], [-0.5, -0.866], [0.5, -0.866],  [0.866, -0.5],
+
+                            [-0.498, -0.867],   [0, -1],    [0.498, -0.867]
+        ]
+
+        for plate in self.plates:
+            if plate.oceanic:
+                for tile in plate.tiles:
+                    if not tile.is_border:
+                        continue
+
+                    vertical_factor = 0.0
+
+                    ## For each neighboring tile, save force delta and direction
+                    for i, neighbor in enumerate(self.get_neighbors(tile.index, distance=2)):
+                        if neighbor.plate_id == plate.id:
+                            continue
+
+                        relative_force = [
+                            neighbor.movement_vector[0] - tile.movement_vector[0],
+                            neighbor.movement_vector[1] - tile.movement_vector[1],
+                        ]
+
+                        ## Neighbors are returned left to right, top to bottom, so we can use the index to determine direction
+                        delta = -neighbor_offsets_map[i][0], -neighbor_offsets_map[i][1]
+
+                        vertical_factor += (relative_force[0] * delta[0] + relative_force[1] * delta[1]) / (2 - int(i in [4, 5, 8, 9, 12, 13])) * int(neighbor.is_oceanic_plate and neighbor.plate_id < tile.plate_id)
+
+                    tile.height += vertical_factor # TMP
+            else:
+                for tile in plate.tiles:
+                    if not tile.is_border:
+                        continue
+
+                    vertical_factor = 0.0
+
+                    ## For each neighboring tile, save force delta and direction
+                    for i, neighbor in enumerate(self.get_neighbors(tile.index, distance=2)):
+                        if neighbor.plate_id == plate.id:
+                            continue
+
+                        relative_force = [
+                            neighbor.movement_vector[0] - tile.movement_vector[0],
+                            neighbor.movement_vector[1] - tile.movement_vector[1],
+                        ]
+
+                        ## Neighbors are returned left to right, top to bottom, so we can use the index to determine direction
+                        delta = -neighbor_offsets_map[i][0], -neighbor_offsets_map[i][1]
+
+                        vertical_factor += (relative_force[0] * delta[0] + relative_force[1] * delta[1]) / (2 - int(i in [4, 5, 8, 9, 12, 13]))
+
+                    tile.height += vertical_factor # TMP
+
+        logging.info("Tectonic force simulation complete.")
+        logging.info("Normalizing tile heights...")
+
+        # 1. Find the height at 70% of tiles
+
+        height_values = sorted(tile.height for tile in self.tiles if tile.height is not None)
+        sea_level = height_values[int(len(height_values) * 0.7)]
+
+        logging.info("Height normalization complete.")
+
+        for plate in self.plates:
+            for tile in plate.tiles:
+                if tile.height is None:
+                    if tile.is_oceanic_plate:
+                        tile.height = settings["height_statistics"]["average_sea_height"]
+                    else:
+                        tile.height = settings["height_statistics"]["average_land_height"]
 
     def _load_grid_from_file(self, grid_path: Path):
         logging.info("Loading grid data from %s...", grid_path)
@@ -386,57 +498,58 @@ class MainWindow(QMainWindow):
         if distance < 1:
             return []
 
-        def direct_neighbors(tile_index: int) -> list[Tile]:
-            direct = []
-            col, row = self.index_to_coords(tile_index)
+        center_col, center_row = self.index_to_coords(index)
 
-            # Right
-            direct.append(self.tiles[self.coords_to_index((col + 1) % GRID_WIDTH, row)])
+        def offset_to_cube(col: int, row: int) -> tuple[int, int, int]:
+            cube_x = col - (row - (row & 1)) // 2
+            cube_z = row
+            cube_y = -cube_x - cube_z
+            return cube_x, cube_y, cube_z
 
-            # Left
-            direct.append(self.tiles[self.coords_to_index((col - 1) % GRID_WIDTH, row)])
+        def wrapped_delta(value: int, origin: int, size: int) -> int:
+            delta = value - origin
+            half_size = size // 2
+            if delta > half_size:
+                delta -= size
+            elif delta < -half_size:
+                delta += size
+            return delta
 
-            # Upper Right
-            if row % 2 == 0:  # Even row
-                direct.append(self.tiles[self.coords_to_index(col, (row - 1) % GRID_HEIGHT)])
-            else:  # Odd row
-                direct.append(self.tiles[self.coords_to_index((col + 1) % GRID_WIDTH, (row - 1) % GRID_HEIGHT)])
+        def neighbor_sort_key(tile: Tile) -> tuple[float, float]:
+            row_delta = wrapped_delta(tile.row, center_row, GRID_HEIGHT)
+            col_delta = wrapped_delta(tile.col, center_col, GRID_WIDTH)
 
-            # Upper Left
-            if row % 2 == 0:  # Even row
-                direct.append(self.tiles[self.coords_to_index((col - 1) % GRID_WIDTH, (row - 1) % GRID_HEIGHT)])
-            else:  # Odd row
-                direct.append(self.tiles[self.coords_to_index(col, (row - 1) % GRID_HEIGHT)])
+            x_offset = col_delta + (((center_row + row_delta) % 2) - (center_row % 2)) * 0.5
+            y_offset = row_delta
 
-            # Lower Right
-            if row % 2 == 0:  # Even row
-                direct.append(self.tiles[self.coords_to_index(col, (row + 1) % GRID_HEIGHT)])
-            else:  # Odd row
-                direct.append(self.tiles[self.coords_to_index((col + 1) % GRID_WIDTH, (row + 1) % GRID_HEIGHT)])
+            return (y_offset, x_offset)
 
-            # Lower Left
-            if row % 2 == 0:  # Even row
-                direct.append(self.tiles[self.coords_to_index((col - 1) % GRID_WIDTH, (row + 1) % GRID_HEIGHT)])
-            else:  # Odd row
-                direct.append(self.tiles[self.coords_to_index(col, (row + 1) % GRID_HEIGHT)])
-
-            return direct
+        center_cube_x, center_cube_y, center_cube_z = offset_to_cube(center_col, center_row)
 
         neighbors = []
         seen = {index}
-        frontier = [index]
 
-        for _ in range(distance):
-            next_frontier = []
-            for tile_index in frontier:
-                for neighbor in direct_neighbors(tile_index):
-                    if neighbor.index in seen:
-                        continue
-                    seen.add(neighbor.index)
-                    neighbors.append(neighbor)
-                    next_frontier.append(neighbor.index)
-            frontier = next_frontier
+        for cube_dx in range(-distance, distance + 1):
+            min_cube_dy = max(-distance, -cube_dx - distance)
+            max_cube_dy = min(distance, -cube_dx + distance)
+            for cube_dy in range(min_cube_dy, max_cube_dy + 1):
+                cube_dz = -cube_dx - cube_dy
 
+                cube_x = center_cube_x + cube_dx
+                cube_y = center_cube_y + cube_dy
+                cube_z = center_cube_z + cube_dz
+
+                candidate_row = cube_z % GRID_HEIGHT
+                candidate_col = (cube_x + (candidate_row - (candidate_row & 1)) // 2) % GRID_WIDTH
+                candidate_index = self.coords_to_index(candidate_col, candidate_row)
+
+                if candidate_index in seen:
+                    continue
+
+                seen.add(candidate_index)
+                neighbors.append(self.tiles[candidate_index])
+
+        neighbors.sort(key=neighbor_sort_key)
         return neighbors
 
     def index_to_coords(self, index: int) -> list[int]:
