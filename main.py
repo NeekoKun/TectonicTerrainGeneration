@@ -17,7 +17,7 @@ from PySide6.QtWidgets import QApplication, QComboBox, QGraphicsScene, QGraphics
 ## Constants ##
 ###############
 
-GRID_SIZE = GRID_WIDTH, GRID_HEIGHT = 200, 200
+GRID_SIZE = GRID_WIDTH, GRID_HEIGHT = 100, 100
 
 COLORS = {
     "ocean_deep": "#2980b9",
@@ -43,7 +43,7 @@ logging.basicConfig(level=logging.INFO, format='[%(asctime)s - %(levelname)s]: %
 
 def height_to_color(height: float):
     if height < settings["colors"]["negative_altitudes"]["min"]:
-        return settings["colors"]["negative_altitudes"]["palette"][-1]
+        return settings["colors"]["negative_altitudes"]["palette"][0]
     elif height > settings["colors"]["positive_altitudes"]["max"]:
         return settings["colors"]["positive_altitudes"]["palette"][0]
     elif height < 0:
@@ -56,7 +56,7 @@ def height_to_color(height: float):
             return settings["colors"]["negative_altitudes"]["palette"][-1]
     else:
         step = settings["colors"]["positive_altitudes"]["max"] / len(settings["colors"]["positive_altitudes"]["palette"])
-        index = int(height / step)
+        index = len(settings["colors"]["positive_altitudes"]["palette"]) - 1 - int(height / step)
         try:
             return settings["colors"]["positive_altitudes"]["palette"][index]
         except IndexError:
@@ -93,6 +93,17 @@ class Plate:
         self.movement_vector: tuple[float, float] = movement_vector
         self.tiles = []
     
+    def __setattr__(self, name, value):
+        super().__setattr__(name, value)
+
+        if name == "oceanic":
+            self.height = random.gauss(settings["height_statistics"]["average_sea_height"], settings["height_statistics"]["sea_height_variance"]) if value else random.gauss(settings["height_statistics"]["average_land_height"], settings["height_statistics"]["land_height_variance"])
+
+            for tile in getattr(self, "tiles", []):
+                tile.is_oceanic_plate = value
+                tile.height = self.height
+                tile.type = "seafloor" if value else "continent"
+
     def add_tile(self, tile: Tile):
         tile.plate_color = self.color
         tile.color = self.color  # Assign the plate's color to the tile
@@ -100,6 +111,12 @@ class Plate:
         tile.is_oceanic_plate = self.oceanic
         tile.movement_vector = self.movement_vector
         tile.height = self.height
+
+        if self.tiles and self.tiles[0].plate_center is not None:
+            tile.plate_center = [self.tiles[0].plate_center[0], self.tiles[0].plate_center[1]]
+        else:
+            tile.plate_center = [tile.col, tile.row]
+
         self.tiles.append(tile)
 
     def remove_tile(self, tile: Tile):
@@ -156,6 +173,29 @@ class HexItem(QGraphicsPolygonItem):
         # Styling
         self.setBrush(QBrush(self.base_color))
         self.setPen(QPen(self.border_color, 1, Qt.PenStyle.SolidLine))
+        self.setAcceptHoverEvents(True)
+        self.setToolTip(self._tooltip_text())
+
+    def _tooltip_text(self) -> str:
+        
+        if self.tile.height is None:
+            height = "N/A"
+        else:
+            height = f"{self.tile.height:.3f}"
+        
+        plate_id = self.tile.plate_id if self.tile.plate_id is not None else "N/A"
+        
+        if self.tile.type == "":
+            type = "N/A"
+        else:
+            type = self.tile.type.capitalize().replace("_", " ")
+
+        return f"Height: {height}\nPlate: {plate_id}\nType: {type}"
+
+    def hoverEnterEvent(self, event):
+        # Refresh tooltip text when the mouse first enters the item
+        self.setToolTip(self._tooltip_text())
+        super().hoverEnterEvent(event)
 
     def update_color(self, color_mode: str):
         if color_mode == "plates":
@@ -171,6 +211,8 @@ class HexItem(QGraphicsPolygonItem):
             s = math.hypot(self.tile.movement_vector[0], self.tile.movement_vector[1])
             l = 0.5
             color = QColor.fromHslF(h, s, l)
+        elif color_mode == "terrain_type":
+            color = QColor(settings["colors"]["tile_types"][self.tile.type])
         else:
             color = QColor(self.tile.color)
 
@@ -275,12 +317,37 @@ class MainWindow(QMainWindow):
         self.color_mode_selector.addItem("Topology", "topology")
         self.color_mode_selector.addItem("Border", "border")
         self.color_mode_selector.addItem("Direction", "direction")
+        self.color_mode_selector.addItem("Terrain Type", "terrain_type")
         self.color_mode_selector.setFixedSize(110, 32)
         self.color_mode_selector.currentIndexChanged.connect(self._on_color_mode_changed)
         self.color_mode_selector.raise_()
 
         self._position_save_button()
         self._position_controls()
+
+    def _refresh_border_flags(self, border_width: int = 2):
+        border_tiles = set()
+
+        for tile in self.tiles:
+            if any(neighbor.plate_id != tile.plate_id for neighbor in self.get_neighbors(tile.index)):
+                border_tiles.add(tile.index)
+
+        frontier = set(border_tiles)
+        for _ in range(max(0, border_width - 1)):
+            next_frontier = set()
+
+            for tile_index in frontier:
+                for neighbor in self.get_neighbors(tile_index):
+                    if neighbor.index in border_tiles:
+                        continue
+
+                    border_tiles.add(neighbor.index)
+                    next_frontier.add(neighbor.index)
+
+            frontier = next_frontier
+
+        for tile in self.tiles:
+            tile.is_border = tile.index in border_tiles
 
     def _generate_grid(self):
         logging.info("Generating grid and plates...")
@@ -297,11 +364,11 @@ class MainWindow(QMainWindow):
             plate = Plate(
                 i,
                 QColor.fromHsl(*hsl_color).name(),
-                oceanic = random.choices([True, False], weights=[6, 4])[0],
+                oceanic = False,
                 movement_vector=(math.cos(math.radians(movement_angle)) * movement_intensity, math.sin(math.radians(movement_angle)) * movement_intensity)
             )
 
-            plate.size = random.randint(100, 300)
+            plate.size = random.randint(50, 80)
 
             while plate.tiles == []:
                 target = random.choice(self.tiles)
@@ -313,73 +380,11 @@ class MainWindow(QMainWindow):
 
         logging.info("Grid and plates generation complete.")
         logging.info("Assigning tiles to plates...")
-
         
-        ## Initial Voronoi
-
-        ## Generate ghosts for wrapping distance calculation
-        origins = []
-
-        for plate in self.plates:
-            origins.append({"id": plate.id, "coors": [plate.tiles[0].col, plate.tiles[0].row]})
-
-            # Upper Left ghost
-            origins.append({"id": plate.id, "coors": [plate.tiles[0].col - GRID_WIDTH, plate.tiles[0].row - GRID_HEIGHT]})
-
-            # Upper ghost
-            origins.append({"id": plate.id, "coors": [plate.tiles[0].col, plate.tiles[0].row - GRID_HEIGHT]})
-
-            # Upper Right ghost
-            origins.append({"id": plate.id, "coors": [plate.tiles[0].col + GRID_WIDTH, plate.tiles[0].row - GRID_HEIGHT]})
-
-            # Left ghost
-            origins.append({"id": plate.id, "coors": [plate.tiles[0].col - GRID_WIDTH, plate.tiles[0].row]})
-
-            # Right ghost
-            origins.append({"id": plate.id, "coors": [plate.tiles[0].col + GRID_WIDTH, plate.tiles[0].row]})
-
-            # Lower Left ghost
-            origins.append({"id": plate.id, "coors": [plate.tiles[0].col - GRID_WIDTH, plate.tiles[0].row + GRID_HEIGHT]})
-
-            # Lower ghost
-            origins.append({"id": plate.id, "coors": [plate.tiles[0].col, plate.tiles[0].row + GRID_HEIGHT]})
-
-            # Lower Right ghost
-            origins.append({"id": plate.id, "coors": [plate.tiles[0].col + GRID_WIDTH, plate.tiles[0].row + GRID_HEIGHT]})
-
-        for tile in tqdm.tqdm(self.tiles, desc="Assigning tiles to plates"):
-            if tile.plate_id is not None:
-                continue
-
-
-            closest_plate_id = min(origins, key=lambda origin: math.hypot(origin["coors"][0] - tile.col + 0.5 * int(origin["coors"][1] % 2) - 0.5 * int(tile.row % 2), origin["coors"][1] - tile.row))["id"]
-            self.plates[closest_plate_id].add_tile(tile)
-            tile.plate_center = [self.plates[closest_plate_id].tiles[0].col, self.plates[closest_plate_id].tiles[0].row]
-
-        for i in range(settings["simulation"]["relaxation_iterations"]):
-            ## Relaxation
-            for plate in self.plates:
-                delta_coordinates: list[int] = [0, 0]
-
-                for tile in plate.tiles:
-                    delta_coordinates[0] += tile.col - tile.plate_center[0]
-                    delta_coordinates[1] += tile.row - tile.plate_center[1]
-
-                delta_coordinates[0] //= len(plate.tiles)
-                delta_coordinates[1] //= len(plate.tiles)
-
-                center_plate = self.tiles[self.coords_to_index(plate.tiles[0].col + delta_coordinates[0], plate.tiles[0].row + delta_coordinates[1])]
-
-                while len(plate.tiles) > 0:
-                    plate.tiles[0].plate_center = None
-                    plate.remove_tile(plate.tiles[0])
-                
-                plate.add_tile(center_plate)
-                center_plate.plate_center = [center_plate.col, center_plate.row]
-
-            ## Voronoi
+        def voronoi(title: str):
             origins = []
 
+            # Ghost origin generation
             for plate in self.plates:
                 origins.append({"id": plate.id, "coors": [plate.tiles[0].col, plate.tiles[0].row]})
 
@@ -407,17 +412,127 @@ class MainWindow(QMainWindow):
                 # Lower Right ghost
                 origins.append({"id": plate.id, "coors": [plate.tiles[0].col + GRID_WIDTH, plate.tiles[0].row + GRID_HEIGHT]})
 
-            for tile in tqdm.tqdm(self.tiles, desc="Assigning tiles to plates"):
+            for tile in tqdm.tqdm(self.tiles, desc=title):
                 if tile.plate_id is not None:
                     continue
 
+                # Sample noise on a clean uniform grid, no hex correction inside
+                raw_col = tile.col * settings["perlin"]["scale"]
+                raw_row = tile.row * settings["perlin"]["scale"] * 0.866  # correct for hex row spacing
 
-                closest_plate_id = min(origins, key=lambda origin: math.hypot(origin["coors"][0] - tile.col + 0.5 * int(origin["coors"][1] % 2) - 0.5 * int(tile.row % 2), origin["coors"][1] - tile.row))["id"]
+                warp_q = pnoise2(raw_col,          raw_row,          octaves=settings["perlin"]["octaves"]) * 20
+                warp_r = pnoise2(raw_col + 214.21, raw_row + 213.12, octaves=settings["perlin"]["octaves"]) * 20
+
+                # Apply hex stagger offset only here, to the final warped coordinates
+                hex_offset = 0.5 * int(tile.row % 2)
+                warped_col = tile.col + hex_offset + warp_q
+                warped_row = tile.row              + warp_r
+
+                closest_plate_id = min(
+                    origins,
+                    key=lambda origin: math.hypot(
+                        origin["coors"][0] - warped_col,
+                        origin["coors"][1] - warped_row
+                    ) - self.plates[origin["id"]].size
+                )["id"]         
                 self.plates[closest_plate_id].add_tile(tile)
                 tile.plate_center = [self.plates[closest_plate_id].tiles[0].col, self.plates[closest_plate_id].tiles[0].row]
 
+        # Initial Voronoi assignment
+        voronoi("Assigning tiles to plates")
+
+        for i in range(settings["simulation"]["relaxation_iterations"]):
+            ## Relaxation
+            for plate in self.plates:
+                delta_coordinates: list[int] = [0, 0]
+
+                for tile in plate.tiles:
+                    try:
+                        delta_coordinates[0] += tile.col - tile.plate_center[0]
+                        delta_coordinates[1] += tile.row - tile.plate_center[1]
+                    except TypeError:
+                        logging.warning("Tile %s has invalid plate center %s", tile.index, tile.plate_center)
+                        continue
+
+                delta_coordinates[0] //= len(plate.tiles)
+                delta_coordinates[1] //= len(plate.tiles)
+
+                center_plate = self.tiles[self.coords_to_index(plate.tiles[0].col + delta_coordinates[0], plate.tiles[0].row + delta_coordinates[1])]
+
+                while len(plate.tiles) > 0:
+                    plate.tiles[0].plate_center = None
+                    plate.remove_tile(plate.tiles[0])
+                
+                plate.add_tile(center_plate)
+                center_plate.plate_center = [center_plate.col, center_plate.row]
+
+            voronoi(f"Relaxation iteration {i + 1}/{settings['simulation']['relaxation_iterations']}")
 
         logging.info("Tile assignment complete.")
+
+        logging.info("Smoothing plate borders...")
+
+        for tile in tqdm.tqdm(self.tiles, desc="Preparing tiles"):
+            tile.movement_vector = self.plates[tile.plate_id].movement_vector
+
+        self._refresh_border_flags(border_width=2)
+
+        for i in range(settings["simulation"]["border_smoothing_iterations"]):
+            count = 0
+
+            for tile in tqdm.tqdm(self.tiles, desc="Smoothing plate borders (iteration {})".format(i + 1)):
+                if not tile.is_border:
+                    continue
+
+                neighbor_plate_ids = [neighbor.plate_id for neighbor in self.get_neighbors(tile.index) if neighbor.plate_id is not None and neighbor.plate_id != tile.plate_id]
+
+                if len(neighbor_plate_ids) == 0:
+                    continue
+
+                if len(neighbor_plate_ids) >= 5:
+                    count += 1
+                    self.plates[tile.plate_id].remove_tile(tile)
+                    self.plates[random.choice(neighbor_plate_ids)].add_tile(tile)
+            
+            if count == 0:
+                logging.info("No border tiles were changed in this iteration, stopping smoothing early.")
+                break
+
+        logging.info("Calculating plate oceanicity based on size...")
+
+        oceanic_percentage = settings["simulation"]["oceanic_percentage"]
+        target_tile_count = oceanic_percentage * len(self.tiles)
+
+        best_error = len(self.tiles)
+        best_attempt: int = 0
+        tile_count = 0
+
+        def get_bit(value: int, bit_index: int) -> bool:
+            return ((value >> bit_index) & 1) != 0
+
+        for i in range(2 ** PLATE_COUNT):
+            if best_error == 0:
+                break
+
+            tile_count = 0
+
+            for plate in self.plates:
+                if get_bit(i, plate.id):
+                    tile_count += len(plate.tiles)
+            
+            error = abs(tile_count - target_tile_count)
+            
+            if error < best_error:
+                best_error = error
+                best_attempt = i
+
+        logging.info("Best oceanic plate configuration has %s tiles (error of %s from target %s tiles).", tile_count, best_error, target_tile_count)
+
+        for plate in self.plates:
+            if get_bit(best_attempt, plate.id):
+                plate.oceanic = True
+            else:
+                plate.oceanic = False
 
         logging.info("Creating height map based on plate forces...")
 
@@ -431,10 +546,7 @@ class MainWindow(QMainWindow):
         for tile in tqdm.tqdm(self.tiles, desc="Preparing tiles"):
             tile.movement_vector = self.plates[tile.plate_id].movement_vector
 
-            if any(neighbor.plate_id != tile.plate_id for neighbor in self.get_neighbors(tile.index, distance=2)):
-                tile.is_border = True
-            else:
-                tile.is_border = False
+        self._refresh_border_flags(border_width=2)
 
         logging.info("Simulating tectonic forces...")
 
@@ -453,15 +565,20 @@ class MainWindow(QMainWindow):
         for plate in self.plates:
             if plate.oceanic:
                 for tile in plate.tiles:
+                    contact_border = False
+
                     if not tile.is_border:
                         continue
 
-                    vertical_factor = 0.0
+                    factors = []
 
                     ## For each neighboring tile, save force delta and direction
                     for i, neighbor in enumerate(self.get_neighbors(tile.index, distance=2)):
                         if neighbor.plate_id == plate.id:
                             continue
+
+                        if i in [4, 5, 8, 9, 12, 13]:
+                            contact_border = True
 
                         relative_force = [
                             neighbor.movement_vector[0] - tile.movement_vector[0],
@@ -469,22 +586,60 @@ class MainWindow(QMainWindow):
                         ]
 
                         ## Neighbors are returned left to right, top to bottom, so we can use the index to determine direction
-                        delta = -neighbor_offsets_map[i][0], -neighbor_offsets_map[i][1]
+                        delta = neighbor_offsets_map[i][0], -neighbor_offsets_map[i][1]
 
-                        vertical_factor += (relative_force[0] * delta[0] + relative_force[1] * delta[1]) / (2 - int(i in [4, 5, 8, 9, 12, 13])) * int(neighbor.is_oceanic_plate and neighbor.plate_id < tile.plate_id)
+                        ## Rotate force by delta angle (delta is already normalized)
 
-                    tile.height += vertical_factor # TMP
+                        rotation_matrix = [
+                            [delta[0], -delta[1]],
+                            [delta[1], delta[0]]
+                        ]
+
+                        rotated_force = [
+                            rotation_matrix[0][0] * relative_force[0] + rotation_matrix[0][1] * relative_force[1],
+                            rotation_matrix[1][0] * relative_force[0] + rotation_matrix[1][1] * relative_force[1]
+                        ]
+
+                        factors.append({"id": neighbor.plate_id, "force": rotated_force})
+
+                    # Needs to be classified into either Oceanic Rift, Accretionary Wedge, Trench or Volcanic Arc
+
+                    # Only consider the plate with the most neighboring tiles
+                    most_common_neighbor_id, _ = Counter(factor["id"] for factor in factors).most_common(1)[0]
+
+                    final_factor = [sum(factor["force"][i] for factor in factors if factor["id"] == most_common_neighbor_id) for i in range(2)]
+
+                    if self.plates[most_common_neighbor_id].oceanic:
+                        if abs(final_factor[1]) > abs(final_factor[0]):
+                            # Shearing between oceanic plates
+                            tile.type = "transform_fault"
+                        else:
+                            if final_factor[0] > 0:
+                                # Divergence between oceanic plates
+                                tile.type = "rift"
+                            else:
+                                tile.type = "trench" if tile.plate_id < most_common_neighbor_id else "volcanic_arc"
+                    else:
+                        if final_factor[0] > 0:
+                            tile.type = "rift"
+                        else:
+                            tile.type = "accretionary_wedge" if contact_border else "trench"
             else:
                 for tile in plate.tiles:
+                    contact_border = False
+
                     if not tile.is_border:
                         continue
 
-                    vertical_factor = 0.0
+                    factors = []
 
                     ## For each neighboring tile, save force delta and direction
                     for i, neighbor in enumerate(self.get_neighbors(tile.index, distance=2)):
                         if neighbor.plate_id == plate.id:
                             continue
+
+                        if i in [4, 5, 8, 9, 12, 13]:
+                            contact_border = True
 
                         relative_force = [
                             neighbor.movement_vector[0] - tile.movement_vector[0],
@@ -492,29 +647,100 @@ class MainWindow(QMainWindow):
                         ]
 
                         ## Neighbors are returned left to right, top to bottom, so we can use the index to determine direction
-                        delta = -neighbor_offsets_map[i][0], -neighbor_offsets_map[i][1]
+                        delta = neighbor_offsets_map[i][0], -neighbor_offsets_map[i][1]
 
-                        vertical_factor += (relative_force[0] * delta[0] + relative_force[1] * delta[1]) / (2 - int(i in [4, 5, 8, 9, 12, 13]))
+                        ## Rotate force by delta angle (delta is already normalized)
 
-                    tile.height += vertical_factor # TMP
+                        rotation_matrix = [
+                            [delta[0], -delta[1]],
+                            [delta[1], delta[0]]
+                        ]
+
+                        rotated_force = [
+                            rotation_matrix[0][0] * relative_force[0] + rotation_matrix[0][1] * relative_force[1],
+                            rotation_matrix[1][0] * relative_force[0] + rotation_matrix[1][1] * relative_force[1]
+                        ]
+
+                        factors.append({"id": neighbor.plate_id, "force": rotated_force})
+
+                    # Needs to be classified into either Oceanic Rift, Accretionary Wedge, Trench or Volcanic Arc
+
+                    # Only consider the plate with the most neighboring tiles
+                    most_common_neighbor_id, _ = Counter(factor["id"] for factor in factors).most_common(1)[0]
+
+                    final_factor = [sum(factor["force"][i] for factor in factors if factor["id"] == most_common_neighbor_id) for i in range(2)]
+
+                    if not self.plates[most_common_neighbor_id].oceanic: # The other plate is continental
+                        if abs(final_factor[1]) > abs(final_factor[0]):
+                            # Shearing between continental plates
+                            tile.type = "continental_transform_fault"
+                        else:
+                            if final_factor[0] > 0:
+                                # Divergence between continental plates
+                                tile.type = "proto_rift"
+                            else:
+                                tile.type = "mountain_range"
+                    else:
+                        if final_factor[0] > 0:
+                            tile.type = "proto_rift"
+                        else:
+                            tile.type = "continental_volcanic_arc"
+
+        for tile in tqdm.tqdm(self.tiles, desc="Smoothing terrain types"):
+            neighbors = self.get_neighbors(tile.index, distance=1)
+
+            if not any(neighbor.type == tile.type for neighbor in neighbors):
+                # This tile type is isolated and HAS to change
+                most_common_type, _ = Counter(neighbor.type for neighbor in neighbors if neighbor.plate_id == tile.plate_id).most_common(1)[0]
+
+                tile.type = most_common_type
+
+            neighbors = self.get_neighbors(tile.index, distance=1)
+
+            # If most neighbors have the same type, assign that type to the tile as well (This is to smooth out isolated tiles with weird classifications)
+            most_common_type, count = Counter(neighbor.type for neighbor in neighbors if neighbor.plate_id == tile.plate_id).most_common(1)[0]
+
+            if count >= 4:
+                tile.type = most_common_type
+        
+        # TODO: Try to move this into the main classification loop
+        for tile in tqdm.tqdm(self.tiles, desc="Finalizing border classification"):
+            close_neighbors = self.get_neighbors(tile.index, distance=1)
+
+            # Need to assign Rift Basin, Rift Shoulders, Continental Back Arc Basins and Oceanic Back Arc Basins
+
+            if tile.type == "proto_rift":
+                # Can be either a rift (if making contact), or a rift basin (if not making contact)
+                if any(neighbor.plate_id != tile.plate_id for neighbor in close_neighbors):
+                    tile.type = "proto_rift"
+                else:
+                    tile.type = "proto_rift_basin"
+            
+            if tile.type == "rift":
+                # Can be either a rift (if making contact), ora a rift basin (if not making contact)
+                if any(neighbor.plate_id != tile.plate_id for neighbor in close_neighbors):
+                    tile.type = "rift"
+                else:
+                    tile.type = "rift_basin"
+        
+        for tile in tqdm.tqdm(self.tiles, desc="Finalizing main land classification"):    
+            close_neighbors = self.get_neighbors(tile.index, distance=1)
+            large_neighbors = self.get_neighbors(tile.index, distance=2)
+
+            if tile.type == "continent":
+                if any(neighbor.type == "continental_volcanic_arc" for neighbor in large_neighbors):
+                    tile.type = "continental_back_arc_basin"
+                elif any(neighbor.type == "mountain_range" for neighbor in close_neighbors):
+                    tile.type = "highland"
+                elif any(neighbor.type == "proto_rift_basin" for neighbor in close_neighbors):
+                    tile.type = "proto_rift_shoulder"
+            elif tile.type == "seafloor":
+                if any(neighbor.type == "volcanic_arc" for neighbor in large_neighbors):
+                    tile.type = "oceanic_back_arc_basin"
+                elif any(neighbor.type == "rift_basin" for neighbor in close_neighbors):
+                    tile.type = "rift_shoulder"
 
         logging.info("Tectonic force simulation complete.")
-        logging.info("Normalizing tile heights...")
-
-        # 1. Find the height at 70% of tiles
-
-        height_values = sorted(tile.height for tile in self.tiles if tile.height is not None)
-        sea_level = height_values[int(len(height_values) * 0.7)]
-
-        logging.info("Height normalization complete.")
-
-        for plate in self.plates:
-            for tile in plate.tiles:
-                if tile.height is None:
-                    if tile.is_oceanic_plate:
-                        tile.height = settings["height_statistics"]["average_sea_height"]
-                    else:
-                        tile.height = settings["height_statistics"]["average_land_height"]
 
     def _load_grid_from_file(self, grid_path: Path):
         logging.info("Loading grid data from %s...", grid_path)
@@ -575,6 +801,11 @@ class MainWindow(QMainWindow):
             cube_y = -cube_x - cube_z
             return cube_x, cube_y, cube_z
 
+        def cube_to_offset(cube_x: int, cube_z: int) -> tuple[int, int]:
+            row = cube_z
+            col = cube_x + (row - (row & 1)) // 2
+            return col % GRID_WIDTH, row % GRID_HEIGHT
+
         def wrapped_delta(value: int, origin: int, size: int) -> int:
             delta = value - origin
             half_size = size // 2
@@ -593,31 +824,40 @@ class MainWindow(QMainWindow):
 
             return (y_offset, x_offset)
 
-        center_cube_x, center_cube_y, center_cube_z = offset_to_cube(center_col, center_row)
+        def wrapped_neighbor_indices(tile_index: int) -> set[int]:
+            tile_col, tile_row = self.index_to_coords(tile_index)
+            cube_x, _, cube_z = offset_to_cube(tile_col, tile_row)
 
-        neighbors = []
+            neighbor_indices = set()
+            for delta_x, delta_y, delta_z in (
+                (1, -1, 0),
+                (1, 0, -1),
+                (0, 1, -1),
+                (-1, 1, 0),
+                (-1, 0, 1),
+                (0, -1, 1),
+            ):
+                candidate_col, candidate_row = cube_to_offset(cube_x + delta_x, cube_z + delta_z)
+                neighbor_indices.add(self.coords_to_index(candidate_col, candidate_row))
+
+            return neighbor_indices
+
+        frontier = {index}
         seen = {index}
 
-        for cube_dx in range(-distance, distance + 1):
-            min_cube_dy = max(-distance, -cube_dx - distance)
-            max_cube_dy = min(distance, -cube_dx + distance)
-            for cube_dy in range(min_cube_dy, max_cube_dy + 1):
-                cube_dz = -cube_dx - cube_dy
+        for _ in range(distance):
+            next_frontier = set()
 
-                cube_x = center_cube_x + cube_dx
-                cube_y = center_cube_y + cube_dy
-                cube_z = center_cube_z + cube_dz
+            for tile_index in frontier:
+                next_frontier.update(wrapped_neighbor_indices(tile_index))
 
-                candidate_row = cube_z % GRID_HEIGHT
-                candidate_col = (cube_x + (candidate_row - (candidate_row & 1)) // 2) % GRID_WIDTH
-                candidate_index = self.coords_to_index(candidate_col, candidate_row)
+            next_frontier.difference_update(seen)
+            seen.update(next_frontier)
+            frontier = next_frontier
 
-                if candidate_index in seen:
-                    continue
+        seen.discard(index)
 
-                seen.add(candidate_index)
-                neighbors.append(self.tiles[candidate_index])
-
+        neighbors = [self.tiles[tile_index] for tile_index in seen]
         neighbors.sort(key=neighbor_sort_key)
         return neighbors
 
@@ -627,7 +867,7 @@ class MainWindow(QMainWindow):
         return [col, row]
     
     def coords_to_index(self, col: int, row: int) -> int:
-        return row * GRID_WIDTH + col
+        return (row % GRID_HEIGHT) * GRID_WIDTH + (col % GRID_WIDTH)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
