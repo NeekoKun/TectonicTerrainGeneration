@@ -17,7 +17,7 @@ from PySide6.QtWidgets import QApplication, QComboBox, QGraphicsScene, QGraphics
 ## Constants ##
 ###############
 
-GRID_SIZE = GRID_WIDTH, GRID_HEIGHT = 100, 100
+GRID_SIZE = GRID_WIDTH, GRID_HEIGHT = 200, 200
 
 COLORS = {
     "ocean_deep": "#2980b9",
@@ -33,7 +33,7 @@ COLORS = {
     "hex_border": "#2c3e50",
 }
 
-PLATE_COUNT = 20
+PLATE_COUNT = 30
 GRID_IMPORT_PATH = Path(__file__).resolve().parent / ".json"
 
 with open(Path(__file__).resolve().parent / "settings.json", "r", encoding="utf-8") as config_file:
@@ -181,7 +181,7 @@ class HexItem(QGraphicsPolygonItem):
         if self.tile.height is None:
             height = "N/A"
         else:
-            height = f"{self.tile.height:.3f}"
+            height = f"{int(self.tile.height)}"
         
         plate_id = self.tile.plate_id if self.tile.plate_id is not None else "N/A"
         
@@ -610,7 +610,7 @@ class MainWindow(QMainWindow):
                     final_factor = [sum(factor["force"][i] for factor in factors if factor["id"] == most_common_neighbor_id) for i in range(2)]
 
                     if self.plates[most_common_neighbor_id].oceanic:
-                        if abs(final_factor[1]) > abs(final_factor[0]):
+                        if abs(final_factor[1]) > 3 * abs(final_factor[0]):
                             # Shearing between oceanic plates
                             tile.type = "transform_fault"
                         else:
@@ -671,7 +671,7 @@ class MainWindow(QMainWindow):
                     final_factor = [sum(factor["force"][i] for factor in factors if factor["id"] == most_common_neighbor_id) for i in range(2)]
 
                     if not self.plates[most_common_neighbor_id].oceanic: # The other plate is continental
-                        if abs(final_factor[1]) > abs(final_factor[0]):
+                        if abs(final_factor[1]) > 3 * abs(final_factor[0]):
                             # Shearing between continental plates
                             tile.type = "continental_transform_fault"
                         else:
@@ -723,15 +723,13 @@ class MainWindow(QMainWindow):
                 else:
                     tile.type = "rift_basin"
         
-        for tile in tqdm.tqdm(self.tiles, desc="Finalizing main land classification"):    
+        for tile in tqdm.tqdm(self.tiles, desc="Finalizing main land classification"):  
             close_neighbors = self.get_neighbors(tile.index, distance=1)
             large_neighbors = self.get_neighbors(tile.index, distance=2)
 
             if tile.type == "continent":
                 if any(neighbor.type == "continental_volcanic_arc" for neighbor in large_neighbors):
                     tile.type = "continental_back_arc_basin"
-                elif any(neighbor.type == "mountain_range" for neighbor in close_neighbors):
-                    tile.type = "highland"
                 elif any(neighbor.type == "proto_rift_basin" for neighbor in close_neighbors):
                     tile.type = "proto_rift_shoulder"
             elif tile.type == "seafloor":
@@ -741,6 +739,42 @@ class MainWindow(QMainWindow):
                     tile.type = "rift_shoulder"
 
         logging.info("Tectonic force simulation complete.")
+
+        logging.info("Calculating border heights...")
+
+        def generate_height_delta(type: str) -> float:
+            low, high = settings["height_statistics"]["ranges"][type]
+            avg = (low + high) / 2
+            variance = (high - low) / 6  # 99.7% of
+            return max(min(random.gauss(avg, variance), high), low)
+
+        for plate in self.plates:
+            for tile in plate.tiles:
+                if tile.type == "seafloor" or tile.type == "continent": 
+                    continue
+
+                height = plate.height
+
+                height += generate_height_delta(tile.type)
+                
+                tile.height = height
+
+        logging.info("Border height calculation complete.")
+
+        logging.info("Running IDW interpolation for internal tiles...")
+
+        for plate in self.plates:
+            for current_tile in plate.tiles:
+                if current_tile.type != "continent" and current_tile.type != "seafloor":
+                    continue
+
+                tiles = [tile for tile in plate.tiles if tile.type != current_tile.type]
+
+                height_sum = sum(tile.height / (math.hypot(tile.col + 0.5 * int(tile.row % 2) - 0.5 * int(current_tile.row % 2) - current_tile.col, tile.row - current_tile.row) ** 2) for tile in tiles if tile.height is not None and (tile.col != current_tile.col or tile.row != current_tile.row))
+                weight_sum = sum(1 / (math.hypot(tile.col + 0.5 * int(tile.row % 2) - 0.5 * int(current_tile.row % 2) - current_tile.col, tile.row - current_tile.row) ** 2) for tile in tiles if tile.height is not None and (tile.col != current_tile.col or tile.row != current_tile.row))
+
+                current_tile.height = height_sum / weight_sum if weight_sum > 0 else 0
+
 
     def _load_grid_from_file(self, grid_path: Path):
         logging.info("Loading grid data from %s...", grid_path)
