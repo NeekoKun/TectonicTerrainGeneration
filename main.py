@@ -17,7 +17,7 @@ from PySide6.QtWidgets import QApplication, QComboBox, QGraphicsScene, QGraphics
 ## Constants ##
 ###############
 
-GRID_SIZE = GRID_WIDTH, GRID_HEIGHT = 100, 100
+GRID_SIZE = GRID_WIDTH, GRID_HEIGHT = 200, 200
 
 COLORS = {
     "ocean_deep": "#2980b9",
@@ -33,7 +33,7 @@ COLORS = {
     "hex_border": "#2c3e50",
 }
 
-PLATE_COUNT = 10
+PLATE_COUNT = 20
 GRID_IMPORT_PATH = Path(__file__).resolve().parent / ".json"
 
 with open(Path(__file__).resolve().parent / "settings.json", "r", encoding="utf-8") as config_file:
@@ -65,28 +65,30 @@ def height_to_color(height: float):
 
 class Tile:
     def __init__(self, col: int, row: int, index: int, color_str: str):
-        self.col = col      # X-axis on a square grid
-        self.row = row      # Y-axis on a square grid
-        self.index = index
-        self.color = color_str
-        self.plate_color = color_str
+        self.col: int = col      # X-axis on a square grid
+        self.row: int = row      # Y-axis on a square grid
+        self.index: int = index
+        self.color: str = color_str
+        self.plate_color: str = color_str
+        self.plate_center: list[int] | None = None
         self.plate_id: int | None = None
-        self.is_oceanic_plate = False
-        self.is_border = True
+        self.is_oceanic_plate: bool = False
+        self.is_border: bool = True
         self.type: str = ""
         self.height: float | None = None
         self.movement_vector: tuple[float, float] = (0.0, 0.0)
 
 class Plate:
     def __init__(self, id: int, color_str: str, oceanic=False, movement_vector=(0.0, 0.0)):
-        self.id = id
-        self.color = color_str
-        self.oceanic = oceanic
+        self.id: int = id
+        self.color: str = color_str
+        self.oceanic: bool = oceanic
+        self.size: int = 0
 
         if self.oceanic:
-            self.height = random.gauss(settings["height_statistics"]["average_sea_height"], settings["height_statistics"]["sea_height_variance"])
+            self.height: float = random.gauss(settings["height_statistics"]["average_sea_height"], settings["height_statistics"]["sea_height_variance"])
         else:
-            self.height = random.gauss(settings["height_statistics"]["average_land_height"], settings["height_statistics"]["land_height_variance"])
+            self.height: float = random.gauss(settings["height_statistics"]["average_land_height"], settings["height_statistics"]["land_height_variance"])
         
         self.movement_vector: tuple[float, float] = movement_vector
         self.tiles = []
@@ -99,6 +101,14 @@ class Plate:
         tile.movement_vector = self.movement_vector
         tile.height = self.height
         self.tiles.append(tile)
+
+    def remove_tile(self, tile: Tile):
+        tile.plate_color = tile.color
+        tile.plate_id = None
+        tile.is_oceanic_plate = False
+        tile.movement_vector = (0.0, 0.0)
+        tile.height = None
+        self.tiles.remove(tile)
 
 
 def blend_colors(start_color: QColor, end_color: QColor, mix: float) -> QColor:
@@ -291,65 +301,124 @@ class MainWindow(QMainWindow):
                 movement_vector=(math.cos(math.radians(movement_angle)) * movement_intensity, math.sin(math.radians(movement_angle)) * movement_intensity)
             )
 
+            plate.size = random.randint(100, 300)
+
             while plate.tiles == []:
                 target = random.choice(self.tiles)
                 if target.plate_id is None:
                     plate.add_tile(target)
+                    target.plate_center = [target.col, target.row]
 
             self.plates.append(plate)
 
         logging.info("Grid and plates generation complete.")
         logging.info("Assigning tiles to plates...")
 
-        perlin_noise_map = [[pnoise2(i * 2 * math.cos(math.radians(30)) + 0.5 * (j % 2), j * (1 + math.sin(math.radians(30))), octaves=10) for i in range(GRID_WIDTH)] for j in range(GRID_HEIGHT)]
+        
+        ## Initial Voronoi
 
-        plates_estimated_sizes = [random.random() for _ in self.plates]
+        ## Generate ghosts for wrapping distance calculation
+        origins = []
 
-        while any(tile.plate_id is None for tile in self.tiles):
-            current_plate = random.choices(self.plates, weights=plates_estimated_sizes, k=1)[0]
+        for plate in self.plates:
+            origins.append({"id": plate.id, "coors": [plate.tiles[0].col, plate.tiles[0].row]})
 
-            neighboring_tiles = set()
+            # Upper Left ghost
+            origins.append({"id": plate.id, "coors": [plate.tiles[0].col - GRID_WIDTH, plate.tiles[0].row - GRID_HEIGHT]})
 
-            for tile in current_plate.tiles:
-                if not tile.is_border:
+            # Upper ghost
+            origins.append({"id": plate.id, "coors": [plate.tiles[0].col, plate.tiles[0].row - GRID_HEIGHT]})
+
+            # Upper Right ghost
+            origins.append({"id": plate.id, "coors": [plate.tiles[0].col + GRID_WIDTH, plate.tiles[0].row - GRID_HEIGHT]})
+
+            # Left ghost
+            origins.append({"id": plate.id, "coors": [plate.tiles[0].col - GRID_WIDTH, plate.tiles[0].row]})
+
+            # Right ghost
+            origins.append({"id": plate.id, "coors": [plate.tiles[0].col + GRID_WIDTH, plate.tiles[0].row]})
+
+            # Lower Left ghost
+            origins.append({"id": plate.id, "coors": [plate.tiles[0].col - GRID_WIDTH, plate.tiles[0].row + GRID_HEIGHT]})
+
+            # Lower ghost
+            origins.append({"id": plate.id, "coors": [plate.tiles[0].col, plate.tiles[0].row + GRID_HEIGHT]})
+
+            # Lower Right ghost
+            origins.append({"id": plate.id, "coors": [plate.tiles[0].col + GRID_WIDTH, plate.tiles[0].row + GRID_HEIGHT]})
+
+        for tile in tqdm.tqdm(self.tiles, desc="Assigning tiles to plates"):
+            if tile.plate_id is not None:
+                continue
+
+
+            closest_plate_id = min(origins, key=lambda origin: math.hypot(origin["coors"][0] - tile.col + 0.5 * int(origin["coors"][1] % 2) - 0.5 * int(tile.row % 2), origin["coors"][1] - tile.row))["id"]
+            self.plates[closest_plate_id].add_tile(tile)
+            tile.plate_center = [self.plates[closest_plate_id].tiles[0].col, self.plates[closest_plate_id].tiles[0].row]
+
+        for i in range(settings["simulation"]["relaxation_iterations"]):
+            ## Relaxation
+            for plate in self.plates:
+                delta_coordinates: list[int] = [0, 0]
+
+                for tile in plate.tiles:
+                    delta_coordinates[0] += tile.col - tile.plate_center[0]
+                    delta_coordinates[1] += tile.row - tile.plate_center[1]
+
+                delta_coordinates[0] //= len(plate.tiles)
+                delta_coordinates[1] //= len(plate.tiles)
+
+                center_plate = self.tiles[self.coords_to_index(plate.tiles[0].col + delta_coordinates[0], plate.tiles[0].row + delta_coordinates[1])]
+
+                while len(plate.tiles) > 0:
+                    plate.tiles[0].plate_center = None
+                    plate.remove_tile(plate.tiles[0])
+                
+                plate.add_tile(center_plate)
+                center_plate.plate_center = [center_plate.col, center_plate.row]
+
+            ## Voronoi
+            origins = []
+
+            for plate in self.plates:
+                origins.append({"id": plate.id, "coors": [plate.tiles[0].col, plate.tiles[0].row]})
+
+                # Upper Left ghost
+                origins.append({"id": plate.id, "coors": [plate.tiles[0].col - GRID_WIDTH, plate.tiles[0].row - GRID_HEIGHT]})
+
+                # Upper ghost
+                origins.append({"id": plate.id, "coors": [plate.tiles[0].col, plate.tiles[0].row - GRID_HEIGHT]})
+
+                # Upper Right ghost
+                origins.append({"id": plate.id, "coors": [plate.tiles[0].col + GRID_WIDTH, plate.tiles[0].row - GRID_HEIGHT]})
+
+                # Left ghost
+                origins.append({"id": plate.id, "coors": [plate.tiles[0].col - GRID_WIDTH, plate.tiles[0].row]})
+
+                # Right ghost
+                origins.append({"id": plate.id, "coors": [plate.tiles[0].col + GRID_WIDTH, plate.tiles[0].row]})
+
+                # Lower Left ghost
+                origins.append({"id": plate.id, "coors": [plate.tiles[0].col - GRID_WIDTH, plate.tiles[0].row + GRID_HEIGHT]})
+
+                # Lower ghost
+                origins.append({"id": plate.id, "coors": [plate.tiles[0].col, plate.tiles[0].row + GRID_HEIGHT]})
+
+                # Lower Right ghost
+                origins.append({"id": plate.id, "coors": [plate.tiles[0].col + GRID_WIDTH, plate.tiles[0].row + GRID_HEIGHT]})
+
+            for tile in tqdm.tqdm(self.tiles, desc="Assigning tiles to plates"):
+                if tile.plate_id is not None:
                     continue
 
-                neighbors = self.get_neighbors(tile.index)
 
-                if all(neighbor.plate_id is tile.plate_id for neighbor in neighbors):
-                    tile.is_border = False
-                    continue
+                closest_plate_id = min(origins, key=lambda origin: math.hypot(origin["coors"][0] - tile.col + 0.5 * int(origin["coors"][1] % 2) - 0.5 * int(tile.row % 2), origin["coors"][1] - tile.row))["id"]
+                self.plates[closest_plate_id].add_tile(tile)
+                tile.plate_center = [self.plates[closest_plate_id].tiles[0].col, self.plates[closest_plate_id].tiles[0].row]
 
-                neighbors = [neighbor for neighbor in neighbors if neighbor.plate_id is None]
-                neighboring_tiles.update(neighbors)
-
-            if neighboring_tiles:
-                next_tile = min(neighboring_tiles, key=lambda t: perlin_noise_map[t.row][t.col])
-                current_plate.add_tile(next_tile)
 
         logging.info("Tile assignment complete.")
-        logging.info("Smoothing borders...")
 
-        for _ in range(len(self.tiles) // 2):
-            i = 0
-
-            for tile in self.tiles:
-                if not tile.is_border:
-                    continue
-
-                neighbors = self.get_neighbors(tile.index)
-
-                if sum(1 for neighbor in neighbors if neighbor.plate_id != tile.plate_id) >= 5:
-                    candidate_plate_ids = [neighbor.plate_id for neighbor in neighbors if neighbor.plate_id is not None and neighbor.plate_id != tile.plate_id]
-                    if candidate_plate_ids:
-                        self.plates[random.choice(candidate_plate_ids)].add_tile(tile)
-                        i += 1
-
-            if i==0:
-                break
-
-
-        logging.info("Border smoothing complete.")
         logging.info("Creating height map based on plate forces...")
 
         for plate in self.plates:
