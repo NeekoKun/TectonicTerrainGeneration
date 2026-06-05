@@ -1,4 +1,5 @@
 import logging
+import csv
 import random
 import json
 import tqdm
@@ -17,7 +18,7 @@ from PySide6.QtWidgets import QApplication, QComboBox, QGraphicsScene, QGraphics
 ## Constants ##
 ###############
 
-GRID_SIZE = GRID_WIDTH, GRID_HEIGHT = 200, 200
+GRID_SIZE = GRID_WIDTH, GRID_HEIGHT = 200, 100
 
 COLORS = {
     "ocean_deep": "#2980b9",
@@ -43,14 +44,14 @@ logging.basicConfig(level=logging.INFO, format='[%(asctime)s - %(levelname)s]: %
 
 def height_to_color(height: float):
     if height < settings["colors"]["negative_altitudes"]["min"]:
-        return settings["colors"]["negative_altitudes"]["palette"][0]
+        return settings["colors"]["negative_altitudes"]["palette"][-1]
     elif height > settings["colors"]["positive_altitudes"]["max"]:
         return settings["colors"]["positive_altitudes"]["palette"][0]
     elif height < 0:
         step = settings["colors"]["negative_altitudes"]["min"] / len(settings["colors"]["negative_altitudes"]["palette"])
         index = int(height / step)
         try:
-            return settings["colors"]["negative_altitudes"]["palette"][-index]
+            return settings["colors"]["negative_altitudes"]["palette"][index]
         except IndexError:
             logging.warning("Height to color mapping failed for height %s: step=%s, index=%s", height, step, index)
             return settings["colors"]["negative_altitudes"]["palette"][-1]
@@ -307,6 +308,7 @@ class MainWindow(QMainWindow):
         self.save_menu = QMenu(self)
         self.save_menu.addAction("save as image", self.save_grid_image)
         self.save_menu.addAction("save grid data", self.save_grid_data)
+        self.save_menu.addAction("save heights", self.save_grid_heights)
         self.save_button.setMenu(self.save_menu)
         self.save_button.setFixedSize(110, 32)
         self.save_button.raise_()
@@ -368,7 +370,7 @@ class MainWindow(QMainWindow):
                 movement_vector=(math.cos(math.radians(movement_angle)) * movement_intensity, math.sin(math.radians(movement_angle)) * movement_intensity)
             )
 
-            plate.size = random.randint(50, 80)
+            plate.size = int(random.gauss(50, 3))
 
             while plate.tiles == []:
                 target = random.choice(self.tiles)
@@ -510,8 +512,10 @@ class MainWindow(QMainWindow):
         def get_bit(value: int, bit_index: int) -> bool:
             return ((value >> bit_index) & 1) != 0
 
-        for i in range(2 ** PLATE_COUNT):
-            if best_error == 0:
+        acceptable_error_margin = settings["simulation"]["oceanicity_error_margin"] * len(self.tiles)
+
+        for i in tqdm.tqdm(range(2 ** PLATE_COUNT), desc="Calculating plate oceanicity"):
+            if best_error <= acceptable_error_margin:
                 break
 
             tile_count = 0
@@ -621,7 +625,7 @@ class MainWindow(QMainWindow):
                                 tile.type = "trench" if tile.plate_id < most_common_neighbor_id else "volcanic_arc"
                     else:
                         if final_factor[0] > 0:
-                            tile.type = "rift"
+                            tile.type = "continental_shelf"
                         else:
                             tile.type = "accretionary_wedge" if contact_border else "trench"
             else:
@@ -682,7 +686,7 @@ class MainWindow(QMainWindow):
                                 tile.type = "mountain_range"
                     else:
                         if final_factor[0] > 0:
-                            tile.type = "proto_rift"
+                            tile.type = "continental_plain"
                         else:
                             tile.type = "continental_volcanic_arc"
 
@@ -691,18 +695,25 @@ class MainWindow(QMainWindow):
 
             if not any(neighbor.type == tile.type for neighbor in neighbors):
                 # This tile type is isolated and HAS to change
-                most_common_type, _ = Counter(neighbor.type for neighbor in neighbors if neighbor.plate_id == tile.plate_id).most_common(1)[0]
-
-                tile.type = most_common_type
+                try:
+                    most_common_type, _ = Counter(neighbor.type for neighbor in neighbors if neighbor.plate_id == tile.plate_id).most_common(1)[0]
+                    tile.type = most_common_type
+                except IndexError:
+                    # Tile is isolated in another plate
+                    pass
 
             neighbors = self.get_neighbors(tile.index, distance=1)
 
             # If most neighbors have the same type, assign that type to the tile as well (This is to smooth out isolated tiles with weird classifications)
-            most_common_type, count = Counter(neighbor.type for neighbor in neighbors if neighbor.plate_id == tile.plate_id).most_common(1)[0]
+            try:
+                most_common_type, count = Counter(neighbor.type for neighbor in neighbors if neighbor.plate_id == tile.plate_id).most_common(1)[0]
 
-            if count >= 4:
-                tile.type = most_common_type
-        
+                if count >= 4:
+                    tile.type = most_common_type
+            except IndexError:
+                # Tile is isolated in another plate
+                pass
+
         # TODO: Try to move this into the main classification loop
         for tile in tqdm.tqdm(self.tiles, desc="Finalizing border classification"):
             close_neighbors = self.get_neighbors(tile.index, distance=1)
@@ -722,6 +733,18 @@ class MainWindow(QMainWindow):
                     tile.type = "rift"
                 else:
                     tile.type = "rift_basin"
+
+        for tile in tqdm.tqdm(self.tiles, desc="Equalizing rift height between plates"):
+            if tile.type in ["rift", "proto_rift"]:
+                neighbors = self.get_neighbors(tile.index, distance=1)
+                neighbor_rift_heights = [neighbor.height for neighbor in neighbors if neighbor.type == tile.type]
+
+                if len(neighbor_rift_heights) == 0:
+                    continue
+
+                average_height = sum(neighbor_rift_heights) / len(neighbor_rift_heights)
+                tile.height = average_height
+        
         
         for tile in tqdm.tqdm(self.tiles, desc="Finalizing main land classification"):  
             close_neighbors = self.get_neighbors(tile.index, distance=1)
@@ -729,7 +752,7 @@ class MainWindow(QMainWindow):
 
             if tile.type == "continent":
                 if any(neighbor.type == "continental_volcanic_arc" for neighbor in large_neighbors):
-                    tile.type = "continental_back_arc_basin"
+                    pass
                 elif any(neighbor.type == "proto_rift_basin" for neighbor in close_neighbors):
                     tile.type = "proto_rift_shoulder"
             elif tile.type == "seafloor":
@@ -763,18 +786,64 @@ class MainWindow(QMainWindow):
 
         logging.info("Running IDW interpolation for internal tiles...")
 
-        for plate in self.plates:
-            for current_tile in plate.tiles:
-                if current_tile.type != "continent" and current_tile.type != "seafloor":
-                    continue
+        for current_tile in tqdm.tqdm(self.tiles, desc="Running IDW interpolation"):
+    
+            if current_tile.type != "continent" and current_tile.type != "seafloor" and current_tile.type != "continental_transform_fault" and current_tile.type != "transform_fault":
+                continue
 
-                tiles = [tile for tile in plate.tiles if tile.type != current_tile.type]
+            tiles = [tile for tile in self.plates[current_tile.plate_id].tiles if tile.type != current_tile.type]
 
-                height_sum = sum(tile.height / (math.hypot(tile.col + 0.5 * int(tile.row % 2) - 0.5 * int(current_tile.row % 2) - current_tile.col, tile.row - current_tile.row) ** 2) for tile in tiles if tile.height is not None and (tile.col != current_tile.col or tile.row != current_tile.row))
-                weight_sum = sum(1 / (math.hypot(tile.col + 0.5 * int(tile.row % 2) - 0.5 * int(current_tile.row % 2) - current_tile.col, tile.row - current_tile.row) ** 2) for tile in tiles if tile.height is not None and (tile.col != current_tile.col or tile.row != current_tile.row))
+            height_sum = sum(tile.height / (math.hypot(tile.col + 0.5 * int(tile.row % 2) - 0.5 * int(current_tile.row % 2) - current_tile.col, tile.row - current_tile.row) ** 2) for tile in tiles if tile.height is not None and (tile.col != current_tile.col or tile.row != current_tile.row))
+            weight_sum = sum(1 / (math.hypot(tile.col + 0.5 * int(tile.row % 2) - 0.5 * int(current_tile.row % 2) - current_tile.col, tile.row - current_tile.row) ** 2) for tile in tiles if tile.height is not None and (tile.col != current_tile.col or tile.row != current_tile.row))
 
-                current_tile.height = height_sum / weight_sum if weight_sum > 0 else 0
+            current_tile.height = height_sum / weight_sum if weight_sum > 0 else 0
 
+        logging.info("IDW interpolation complete.")
+
+        logging.info("Smoothing height with kernel radius 1...")
+
+        smoothed_heights = {}
+        for current_tile in self.tiles:
+            allowed_types = settings["simulation"]["height_smoothing_matrix"].get(current_tile.type, [])
+            if not allowed_types:
+                smoothed_heights[current_tile.index] = current_tile.height
+                continue
+
+            neighbors = self.get_neighbors(current_tile.index, distance=1)
+            compatible_neighbors = [tile for tile in neighbors if tile.type in allowed_types and tile.height is not None]
+
+            if compatible_neighbors:
+                avg_height = sum(float(tile.height) for tile in compatible_neighbors) / len(compatible_neighbors)
+                current_height = float(current_tile.height) if current_tile.height is not None else 0.0
+                smoothed_heights[current_tile.index] = (current_height + avg_height) / 2
+            else:
+                smoothed_heights[current_tile.index] = current_tile.height
+
+        for tile in self.tiles:
+            tile.height = smoothed_heights[tile.index]
+
+        continental_shelf_heights = [tile.height for tile in self.tiles if tile.type == "continental_shelfs" and tile.height is not None]
+        if continental_shelf_heights:
+            max_shelf_height = max(float(height) for height in continental_shelf_heights)
+            for tile in self.tiles:
+                if tile.type == "continental_plains" and tile.height is not None and tile.height <= max_shelf_height:
+                    tile.height = max_shelf_height + 0.01
+
+        logging.info("Height smoothing complete.")
+
+        logging.info("Applying perlin noise on terrain heights...")
+
+        for tile in tqdm.tqdm(self.tiles, desc="Applying Perlin noise on terrain heights"):
+            if tile.height is None:
+                continue
+
+            raw_col = tile.col * settings["perlin"]["scale"]
+            raw_row = tile.row * settings["perlin"]["scale"] * 0.866  # correct for hex row spacing
+
+            noise_value = pnoise2(raw_col, raw_row, octaves=settings["perlin"]["octaves"])
+            tile.height += noise_value * settings["perlin"]["height_multiplier"]
+
+        logging.info("Perlin noise applied to terrain heights.")
 
     def _load_grid_from_file(self, grid_path: Path):
         logging.info("Loading grid data from %s...", grid_path)
@@ -978,6 +1047,26 @@ class MainWindow(QMainWindow):
 
         with output_path.open("w", encoding="utf-8") as file_handle:
             json.dump(data, file_handle, indent=2)
+
+    def save_grid_heights(self):
+        output_path = Path(__file__).resolve().parent / f"grid_heights_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+
+        with output_path.open("w", encoding="utf-8", newline="") as file_handle:
+            writer = csv.writer(file_handle)
+            writer.writerow(["x", "y", "height"])
+
+            for tile in self.tiles:
+                x, y = self.tile_to_canvas_position(tile)
+                writer.writerow([x, y, tile.height])
+
+    def tile_to_canvas_position(self, tile: Tile) -> tuple[float, float]:
+        hex_radius = 30.0
+        width = math.sqrt(3) * hex_radius
+        x = tile.col * width
+        if tile.row % 2 != 0:
+            x += 0.5 * width
+        y = tile.row * (1.5 * hex_radius)
+        return x, y
 
     def select_hex(self, hex_item: HexItem):
         if self.selected_hex is hex_item:
